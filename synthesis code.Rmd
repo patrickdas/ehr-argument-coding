@@ -1,0 +1,766 @@
+---
+title: "synthesis code"
+author: "Patrick Das"
+date: "2025-07-07"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data cleaning and transformation
+
+## Load packages
+
+```{r error=FALSE, message=FALSE, warning=FALSE, tidy=TRUE}
+library(tidyr)
+library(readr)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(ggrepel)
+library(nnet)
+library(lmtest)
+library(nortest)
+library(spdep)
+library(lme4)
+library(lmerTest) 
+library(MuMIn)
+
+data <- read_tsv("synthesis aggregrate data.txt")
+
+data <- data[, colSums(is.na(data)) == 0] #dropping columns with NA values
+
+data[data == "N/A"] <- NA #rewriting "NA" values in text to reflect actual NA
+
+data <- data %>% drop_na() #dropping observations with NA values 
+
+
+```
+
+## Data preparation
+
+### Converting variables to factors
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+data <- data %>%
+  mutate(across(where(is.character), as.factor)) #converting chr to factors
+
+```
+
+### Cleaning column names
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Create clean, consistent column names
+clean_names <- names(data)
+
+# Replace spaces and punctuation with underscores
+clean_names <- gsub(" ", "_", clean_names)             # spaces → _
+clean_names <- gsub("\\?", "", clean_names)            # remove question marks
+clean_names <- gsub("\\(", "", clean_names)            # remove (
+clean_names <- gsub("\\)", "", clean_names)            # remove )
+clean_names <- gsub("\\/", "_", clean_names)           # slashes → _
+clean_names <- gsub("\\+", "plus", clean_names)        # plus signs → 'plus'
+clean_names <- gsub("-", "_", clean_names)             # hyphens → _
+clean_names <- gsub("__+", "_", clean_names)           # collapse double underscores
+clean_names <- gsub("[^[:alnum:]_]", "", clean_names)  # remove anything not alphanumeric or underscore
+clean_names <- tolower(clean_names)                    # make all lowercase (optional)
+
+# Apply new names to the dataframe
+names(data) <- clean_names
+
+# Applying custom mapping
+names(data)[names(data) == "granular_case_marking_alignment_type"] <- "granular_alignment"
+names(data)[names(data) == "case_marking_complexity_distinctions_plus_optionality"] <- "case_marking_complexity"
+names(data)[names(data) == "spoken_as_an_l2"] <- "L2"
+names(data)[names(data) == "speaker_population"] <- "population"
+names(data)[names(data) == "agriculture_intensity_based_on_ea028"] <- "agricultural_intensity"
+names(data)[names(data) == "political_organization_ea033"] <- "political_organization"
+names(data)[names(data) == "altitude_sampled_raster_value_from_dem"] <- "altitude"
+names(data)[names(data) == "subfamily_node_below_top_level"] <- "subfamily"
+names(data)[names(data) == "language_family_top_level_node"] <- "family"
+
+```
+
+### Creating/transforming variables
+
+#### Binarizing agricultural intensity
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+data$agriculture_binary <- ifelse(
+  data$agricultural_intensity == "Intensive/irrigated", 1, 0
+)
+table(data$agriculture_binary)
+```
+#### Binarizing political organization
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+data$political_organization_binary <- ifelse(
+  data$political_organization == "State", 1, 0
+  )
+table(data$political_organization_binary)
+
+```
+#### Binarizing hill/valley (needed for ecological mode)
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Create hill_binary variable (1 = Hill, 0 = Valley or Split)
+data$hill_binary <- ifelse(data$hill_valley == "Hill", 1, 0)
+
+table(data$hill_valley, data$hill_binary)
+```
+
+#### Scaling variables
+
+Scaling population
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+#let's scale populaiton
+data$scaled_population <- scale(data$population)
+# Scaling geographic predictors
+data$scaled_altitude <- scale(data$altitude)[, 1]
+data$scaled_stdev_slope <- scale(data$stdev_of_slope)[, 1]
+```
+
+Scaling complexity scores
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+#First, individual measures of complexity are scaled
+data$scaled_case_marking_complexity <- scale(data$case_marking_complexity)
+data$scaled_form_complexity <- scale(data$form_complexity)
+data$scaled_cell_complexity <- scale(data$cell_complexity)
+```
+
+# Initial Analysis (with Limbu)
+
+## Hill/Valley classification 
+Predicting the complexity of a language system based on hill/valley classification
+
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Cell complexity model
+model_cell <- lmer(scaled_cell_complexity ~ hill_valley + (1 | subfamily), data = data)
+summary(model_cell)
+
+# Form complexity model
+model_form <- lmer(scaled_form_complexity ~ hill_valley + (1 | subfamily), data = data)
+summary(model_form)
+
+# Case marking complexity model
+model_case <- lmer(scaled_case_marking_complexity ~ hill_valley + (1 | subfamily), data = data)
+summary(model_case)
+
+
+```
+# Visualizing data, identifying and removing outliers, and testing assumptions
+
+## Visualizing complexity against hill/valley via box-plots
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Reshape the data
+data_long <- data %>%
+  select(hill_valley, scaled_cell_complexity, scaled_form_complexity, scaled_case_marking_complexity) %>%
+  pivot_longer(
+    cols = starts_with("scaled_"),
+    names_to = "complexity_type",
+    values_to = "score"
+  ) %>%
+  mutate(complexity_type = case_when(
+    complexity_type == "scaled_cell_complexity" ~ "Cell Complexity",
+    complexity_type == "scaled_form_complexity" ~ "Form Complexity",
+    complexity_type == "scaled_case_marking_complexity" ~ "Case Marking Complexity"
+  ))
+ggplot(data_long, aes(x = hill_valley, y = score, fill = hill_valley)) +
+  geom_boxplot() +
+  facet_wrap(~ complexity_type, scales = "free_y", 
+             labeller = label_wrap_gen(width = 15)) +
+  labs(
+    title = "Morphological Complexity by Hill/Valley",
+    x = "Societal Setting", y = "Scaled Complexity Score"
+  ) +
+  scale_fill_brewer(palette = "Pastel2") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+
+## sensitivity testing
+
+Identifying outliers and influential values
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+form_cooks <- cooks.distance(model_form)
+cell_cooks <- cooks.distance(model_cell)
+case_cooks <- cooks.distance(model_case)
+
+# Set threshold
+threshold <- 4 / nrow(data)
+
+# Identify outliers
+form_outlier <- which(form_cooks > threshold)
+cell_outlier <- which(cell_cooks > threshold)
+case_outlier <- which(case_cooks >threshold)
+
+
+#and most influential
+which.max(form_cooks)
+which.max(cell_cooks)
+which.max(case_cooks)
+
+# For Limbu
+limbu_form <- form_cooks[data$language == "Limbu"]
+limbu_cell <- cell_cooks[data$language == "Limbu"]
+
+# For Bori-Karko
+bori_case <- case_cooks[data$language == "Bori-Karko"]
+
+#printing out most influential observations
+# For form complexity
+data[which.max(form_cooks), ]
+limbu_form
+# For cell complexity
+data[which.max(cell_cooks), ]
+limbu_cell
+# For case complexity
+data[which.max(case_cooks), ]
+bori_case
+```
+## Visualizing outliers
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Creating tidy Cook's data with language preserved
+cook_data <- data %>%
+  mutate(
+    obs = row_number(),
+    form = form_cooks,
+    cell = cell_cooks,
+    case = case_cooks
+  ) %>%
+  select(obs, language, form, cell, case)
+
+# Pivoting to long format for ggplot
+cook_long <- cook_data %>%
+  pivot_longer(cols = c(form, cell, case),
+               names_to = "model", values_to = "cooks") %>%
+  mutate(
+    outlier = cooks > threshold,
+    label = ifelse(outlier, as.character(language), NA)
+  )
+
+# Plotting with labeled outliers
+ggplot(cook_long, aes(x = obs, y = cooks, color = outlier, label = label)) +
+  geom_point() +
+  geom_hline(yintercept = threshold, linetype = "dashed", color = "red") +
+  geom_text(nudge_y = 0.01, check_overlap = TRUE, size = 3.2) +
+  facet_wrap(~ model, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Cook's Distance with Influential Languages Labeled",
+       x = "Observation", y = "Cook's Distance") +
+  scale_color_manual(values = c("black", "firebrick"))+
+  theme(plot.margin = margin(10, 20, 10, 10))  # top, right, bottom, left (in pts)
+
+```
+
+## Creating a new dataset without Limbu and Bodo-Mech
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+data_sensitivity <- data[data$language != "Limbu", ]
+
+```
+
+## Visualizing variables
+
+### Visualizing ecological variables against hill/valley classification
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Create long-format data for both terrain variables
+terrain_data <- data_sensitivity %>%
+  select(hill_valley, altitude, stdev_of_slope) %>%
+  pivot_longer(
+    cols = c(altitude, stdev_of_slope),
+    names_to = "terrain_variable",
+    values_to = "value"
+  ) %>%
+  mutate(terrain_variable = case_when(
+    terrain_variable == "altitude" ~ "Elevation (meters)",
+    terrain_variable == "stdev_of_slope" ~ "Terrain roughness"
+  ))
+
+# Create faceted boxplot
+ggplot(terrain_data, aes(x = hill_valley, y = value, fill = hill_valley)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  facet_wrap(~ terrain_variable, scales = "free_y") +
+  labs(
+    title = "Proposed Ecological Variables vs. Hill/Valley Classification",
+    x = "Societal Classification", 
+    y = "Ecological variables",
+    fill = "Classification"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 12)
+  )
+```
+
+
+# Analysis (after removing Limbu)
+
+## Predicting complexity based on hill/valley classification 
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Cell complexity model
+model_cell_sensitivity <- lmer(scaled_cell_complexity ~ hill_valley + (1 | subfamily),
+                               data = data_sensitivity)
+
+# Form complexity model
+model_form_sensitivity <- lmer(scaled_form_complexity ~ hill_valley + (1 | subfamily),
+                                data = data_sensitivity)
+
+# Case complexity model
+model_case_sensitivity <- lmer(scaled_case_marking_complexity ~ hill_valley + (1 | subfamily),
+                                data = data_sensitivity)
+
+# View summaries
+summary(model_cell_sensitivity)
+summary(model_form_sensitivity)
+summary(model_case_sensitivity)
+
+```
+No significant effect (but directionality changed for Cell/Form models)
+
+## Testing assumptions
+
+### Plotting residuals
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+plot_residuals <- function(model, title) {
+  # Create plot
+  plot(fitted(model), residuals(model),
+       xlab = "Fitted Values", ylab = "Residuals",
+       main = paste("Residuals vs Fitted (", title, ")", sep=""))
+  # Add reference line
+  abline(h = 0, col = "red", lty = 2)
+}
+par(mfrow = c(2, 2))  # Set up a 2x2 plotting area
+
+# Plot each model
+plot_residuals(model_cell_sensitivity, "Cell Complexity")
+plot_residuals(model_form_sensitivity, "Form Complexity")
+plot_residuals(model_case_sensitivity, "Case Marking Complexity")
+
+```
+
+### Q-Q line and Shapiro wilk test
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Q-Q plot cell
+qqnorm(resid(model_cell_sensitivity), main = "Q-Q Plot (Cell Complexity)")
+qqline(resid(model_cell_sensitivity), col = "red")
+
+# Shapiro-Wilk test
+shapiro.test(resid(model_cell_sensitivity))
+
+# Q-Q plot
+qqnorm(resid(model_form_sensitivity), main = "Q-Q Plot (Form Complexity)")
+qqline(resid(model_form_sensitivity), col = "red")
+
+# Shapiro-Wilk test
+shapiro.test(resid(model_form_sensitivity))
+
+# Q-Q plot
+qqnorm(resid(model_case_sensitivity), main = "Q-Q Plot (Case Marking Complexity)")
+qqline(resid(model_case_sensitivity), col = "red")
+
+# Shapiro-Wilk test
+shapiro.test(resid(model_case_sensitivity))
+```
+
+### Normality of random effects
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Extract random effects
+ranef_subfam <- ranef(model_cell_sensitivity)$subfamily
+
+# Check normality of random effects
+qqnorm(ranef_subfam[,1])
+qqline(ranef_subfam[,1])
+shapiro.test(ranef_subfam[,1])
+```
+
+## Predicting Hill/Valley classification from ecological variables
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Binarizing hill/valley classification: Hill = 1, others = 0
+data_sensitivity$hill_binary <- ifelse(data_sensitivity$hill_valley == "Hill", 1, 0)
+
+# Fitting logistic regression model
+hill_ecology_model <- glm(
+  hill_binary ~ scaled_altitude + scaled_stdev_slope,
+  family = binomial,
+  data = data_sensitivity
+)
+
+hill_altitude <- glm(hill_binary ~ scaled_altitude, family = binomial, data = data_sensitivity)
+hill_slope <- glm(hill_binary ~ scaled_stdev_slope, family = binomial, data = data_sensitivity)
+
+# Summarizing model output
+summary(hill_ecology_model)
+summary(hill_altitude)
+summary(hill_slope)
+
+
+```
+## Analysing complexity as predicted by sociocultural variables
+
+### Complexity as predicted by L2_status
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# 1. L2 STATUS EFFECTS
+# Cell complexity model
+cell_L2_mixed <- lmer(scaled_cell_complexity ~ L2 + (1|subfamily), data = data_sensitivity)
+
+# Form complexity model
+form_L2_mixed <- lmer(scaled_form_complexity ~ L2 + (1|subfamily), data = data_sensitivity)
+
+# Case marking complexity model
+case_L2_mixed <- lmer(scaled_case_marking_complexity ~ L2 + (1|subfamily), data = data_sensitivity)
+
+# View L2 model summaries
+summary(cell_L2_mixed)
+summary(form_L2_mixed)
+summary(case_L2_mixed)
+```
+
+#### If Limbu is added back in
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# 1. L2 STATUS EFFECTS
+# Cell complexity model
+cell_L2_mixed_orig <- lmer(scaled_cell_complexity ~ L2 + (1|subfamily), data = data)
+
+# Form complexity model
+form_L2_mixed_orig <- lmer(scaled_form_complexity ~ L2 + (1|subfamily), data = data)
+
+# Case marking complexity model
+case_L2_mixed_orig <- lmer(scaled_case_marking_complexity ~ L2 + (1|subfamily), data = data)
+
+# View L2 model summaries
+summary(cell_L2_mixed_orig)
+summary(form_L2_mixed_orig)
+summary(case_L2_mixed_orig)
+```
+
+#### Is effect of L2 on cell_complexity robust to dropping languages?
+
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Create a dataframe to store results
+drop_one_results <- data.frame(
+  dropped_language = character(),
+  estimate = numeric(),
+  std_error = numeric(),
+  p_value = numeric(),
+  significant = logical(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each language in data_sensitivity
+for (lang in unique(data_sensitivity$language)) {
+  # Create dataset with one additional language dropped
+  temp_data <- data_sensitivity[data_sensitivity$language != lang, ]
+  
+  # Fit the model
+  temp_model <- lmer(scaled_cell_complexity ~ L2 + (1|subfamily), data = temp_data)
+  
+  # Extract model summary
+  model_summary <- summary(temp_model)
+  
+  # Get L2 coefficient (second row in fixed effects table)
+  l2_coef <- model_summary$coefficients[2, "Estimate"]
+  l2_se <- model_summary$coefficients[2, "Std. Error"]
+  l2_p <- model_summary$coefficients[2, "Pr(>|t|)"]
+  
+  # Add to results dataframe
+  drop_one_results <- rbind(drop_one_results, data.frame(
+    dropped_language = lang,
+    estimate = l2_coef,
+    std_error = l2_se,
+    p_value = l2_p,
+    significant = l2_p < 0.05
+  ))
+}
+
+# Sort results by p-value
+drop_one_results <- drop_one_results[order(drop_one_results$p_value), ]
+
+# Look at summary statistics
+cat("Number of iterations where L2 effect is significant:", sum(drop_one_results$significant), 
+    "out of", nrow(drop_one_results), "\n")
+cat("Range of L2 coefficient estimates:", 
+    round(min(drop_one_results$estimate), 3), "to", 
+    round(max(drop_one_results$estimate), 3), "\n")
+cat("Median p-value:", round(median(drop_one_results$p_value), 3), "\n")
+
+# Plot the results
+ggplot(drop_one_results, aes(x = reorder(dropped_language, p_value), y = estimate, 
+                           fill = significant)) +
+  geom_bar(stat = "identity") +
+  geom_errorbar(aes(ymin = estimate - std_error, ymax = estimate + std_error), width = 0.2) +
+  coord_flip() +
+  labs(title = "L2 Effect on Cell Complexity - Drop-One Analysis",
+       subtitle = "Effect of removing each language after Limbu already removed",
+       x = "Second Removed Language", 
+       y = "L2 Coefficient Estimate",
+       fill = "Significant (p < 0.05)") +
+  theme_minimal() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "darkgray")
+```
+### Complexity ~ Population
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# 2. POPULATION SIZE EFFECTS
+cell_pop_mixed <- lmer(scaled_cell_complexity ~ scaled_population + (1|subfamily), data = data_sensitivity)
+form_pop_mixed <- lmer(scaled_form_complexity ~ scaled_population + (1|subfamily), data = data_sensitivity)
+case_pop_mixed <- lmer(scaled_case_marking_complexity ~ scaled_population + (1|subfamily), data = data_sensitivity)
+
+# View population model summaries
+summary(cell_pop_mixed)
+summary(form_pop_mixed)
+summary(case_pop_mixed)
+```
+
+### Complexity ~ agricultural intensity
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+
+
+# 3. AGRICULTURAL INTENSITY EFFECTS
+cell_agr_mixed <- lmer(scaled_cell_complexity ~ agriculture_binary + (1|subfamily), data = data_sensitivity)
+form_agr_mixed <- lmer(scaled_form_complexity ~ agriculture_binary + (1|subfamily), data = data_sensitivity)
+case_agr_mixed <- lmer(scaled_case_marking_complexity ~ agriculture_binary + (1|subfamily), data = data_sensitivity)
+
+# View agriculture model summaries
+summary(cell_agr_mixed)
+summary(form_agr_mixed)
+summary(case_agr_mixed)
+```
+### complexity ~ political organization
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# 4. POLITICAL ORGANIZATION EFFECTS
+cell_pol_mixed <- lmer(scaled_cell_complexity ~ political_organization_binary + (1|subfamily), data = data_sensitivity)
+form_pol_mixed <- lmer(scaled_form_complexity ~ political_organization_binary + (1|subfamily), data = data_sensitivity)
+case_pol_mixed <- lmer(scaled_case_marking_complexity ~ political_organization_binary + (1|subfamily), data = data_sensitivity)
+
+# View political organization model summaries
+summary(cell_pol_mixed)
+summary(form_pol_mixed)
+summary(case_pol_mixed)
+```
+
+## R-squared values for major analyses
+
+### Complexity ~ Hill/Valley models
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+r.squaredGLMM(model_case_sensitivity)
+r.squaredGLMM(model_cell_sensitivity)
+r.squaredGLMM(model_form_sensitivity)
+r.squaredGLMM(model_case)
+r.squaredGLMM(model_cell)
+r.squaredGLMM(model_form)
+```
+### Hill/Valley ~ ecology models
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+r.squaredGLMM(hill_ecology_model)
+r.squaredGLMM(hill_altitude)
+r.squaredGLMM(hill_slope)
+```
+### Complexity ~ sociocultural variables
+
+#### L2_status
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+r.squaredGLMM(cell_L2_mixed)
+r.squaredGLMM(form_L2_mixed)
+r.squaredGLMM(case_L2_mixed)
+```
+#### population size
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+r.squaredGLMM(cell_pop_mixed)
+r.squaredGLMM(form_pop_mixed)
+r.squaredGLMM(case_pop_mixed)
+```
+#### agricultural_intensity
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+r.squaredGLMM(cell_agr_mixed)
+r.squaredGLMM(form_agr_mixed)
+r.squaredGLMM(case_agr_mixed)
+```
+#### political_organization
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+r.squaredGLMM(cell_pol_mixed)
+r.squaredGLMM(form_pol_mixed)
+r.squaredGLMM(case_pol_mixed)
+```
+
+# Additional analyses
+
+## Categorizing Split as Hill languages instead
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Alternative classification: Hill + Valley = 1, Split = 0
+data_sensitivity$hill_valley_binary <- ifelse(data_sensitivity$hill_valley == "Split", 0, 1)
+
+# Fitting logistic regression models with alternative classification
+hill_valley_ecology_model <- glm(
+  hill_valley_binary ~ scaled_altitude + scaled_stdev_slope,
+  family = binomial,
+  data = data_sensitivity
+)
+
+hill_valley_altitude <- glm(hill_valley_binary ~ scaled_altitude, family = binomial, data = data_sensitivity)
+hill_valley_slope <- glm(hill_valley_binary ~ scaled_stdev_slope, family = binomial, data = data_sensitivity)
+
+# Summarizing model output
+summary(hill_valley_ecology_model)
+summary(hill_valley_altitude)
+summary(hill_valley_slope)
+
+```
+
+## Ecological variables as a predictor of complexity
+
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+## ALTITUDE MODELS
+# Altitude models - full dataset
+cell_alt_mixed <- lmer(scaled_cell_complexity ~ scaled_altitude + (1|subfamily), data = data)
+form_alt_mixed <- lmer(scaled_form_complexity ~ scaled_altitude + (1|subfamily), data = data)
+case_alt_mixed <- lmer(scaled_case_marking_complexity ~ scaled_altitude + (1|subfamily), data = data)
+
+# Altitude models - sensitivity dataset (without Limbu)
+cell_alt_mixed_sens <- lmer(scaled_cell_complexity ~ scaled_altitude + (1|subfamily), data = data_sensitivity)
+form_alt_mixed_sens <- lmer(scaled_form_complexity ~ scaled_altitude + (1|subfamily), data = data_sensitivity)
+case_alt_mixed_sens <- lmer(scaled_case_marking_complexity ~ scaled_altitude + (1|subfamily), data = data_sensitivity)
+
+# Slope variability models - full dataset
+cell_slope_mixed <- lmer(scaled_cell_complexity ~ scaled_stdev_slope + (1|subfamily), data = data)
+form_slope_mixed <- lmer(scaled_form_complexity ~ scaled_stdev_slope + (1|subfamily), data = data)
+case_slope_mixed <- lmer(scaled_case_marking_complexity ~ scaled_stdev_slope + (1|subfamily), data = data)
+
+# Slope variability models - sensitivity dataset (without Limbu)
+cell_slope_mixed_sens <- lmer(scaled_cell_complexity ~ scaled_stdev_slope + (1|subfamily), data = data_sensitivity)
+form_slope_mixed_sens <- lmer(scaled_form_complexity ~ scaled_stdev_slope + (1|subfamily), data = data_sensitivity)
+case_slope_mixed_sens <- lmer(scaled_case_marking_complexity ~ scaled_stdev_slope + (1|subfamily), data = data_sensitivity)
+
+# Get summaries for altitude models
+summary(cell_alt_mixed)
+summary(form_alt_mixed)
+summary(case_alt_mixed)
+summary(cell_alt_mixed_sens)
+summary(form_alt_mixed_sens)
+summary(case_alt_mixed_sens)
+
+# Get summaries for slope variability models
+summary(cell_slope_mixed)
+summary(form_slope_mixed)
+summary(case_slope_mixed)
+summary(cell_slope_mixed_sens)
+summary(form_slope_mixed_sens)
+summary(case_slope_mixed_sens)
+
+```
+
+## Languages miscategorized as Hill/Valley
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Check if there are Hill languages with below-average cell complexity
+hill_languages <- filter(data, hill_valley == "Hill") %>%
+  mutate(below_average = scaled_cell_complexity < 0) %>%
+  arrange(scaled_cell_complexity)
+
+print("Hill languages sorted by cell complexity (lowest first):")
+print(select(hill_languages, language, scaled_cell_complexity, below_average))
+```
+
+### Plotting
+
+```{r tidy = TRUE, message = FALSE, warning = FALSE, error = FALSE}
+# Create classification based on theoretical expectations using mean (0)
+data_with_theoretical_mismatches <- data %>%
+  mutate(
+    # Classify based on complexity relative to the mean (0)
+    theoretical_status = case_when(
+      # Hill languages with below-mean complexity
+      hill_valley == "Hill" & scaled_cell_complexity < 0 ~ 
+        "Misclassified (Low Complexity Hill)",
+      
+      # Valley languages with above-mean complexity
+      hill_valley == "Valley" & scaled_cell_complexity > 0 ~ 
+        "Misclassified (High Complexity Valley)",
+      
+      # Everything else matches theoretical expectations
+      TRUE ~ "Matches Theory"
+    )
+  )
+
+# Check the distribution of theoretical status
+print(table(data_with_theoretical_mismatches$theoretical_status))
+
+# Create scatter plot
+ggplot(data_with_theoretical_mismatches, aes(x = scaled_cell_complexity, y = scaled_case_marking_complexity)) +
+  # Adding quadrant lines at means (0 for scaled variables)
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  
+  # Plot points
+  geom_point(aes(
+    shape = hill_valley,
+    color = theoretical_status,
+    size = theoretical_status
+  )) +
+  
+  # Add labels for misclassified languages
+  geom_text_repel(
+    data = filter(data_with_theoretical_mismatches, theoretical_status != "Matches Theory"),
+    aes(label = language),
+    box.padding = 0.8,
+    point.padding = 0.5,
+    force = 8,
+    seed = 123
+  ) +
+  
+  # Customize appearance
+  scale_shape_manual(values = c("Hill" = 17, "Valley" = 16, "Split" = 15)) +
+  scale_color_manual(values = c(
+    "Matches Theory" = "gray70", 
+    "Misclassified (Low Complexity Hill)" = "#3366CC",
+    "Misclassified (High Complexity Valley)" = "#339900"
+  )) +
+  scale_size_manual(values = c(
+    "Matches Theory" = 2, 
+    "Misclassified (Low Complexity Hill)" = 3.5,
+    "Misclassified (High Complexity Valley)" = 3.5
+  )) +
+  
+  # Add labels
+  labs(
+    title = "Cell Complexity vs. Case Marking in Hill/Valley Languages",
+    x = "Cell Complexity (scaled)",
+    y = "Case Marking Complexity (scaled)",
+    shape = "Classification",
+    color = "Theory Alignment",
+    size = "Theory Alignment"
+  ) +
+  
+  # Visual theme
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+```
+
